@@ -5,7 +5,7 @@ use anchor_spl::{
 
 };
 
-declare_id!("AFuVpFDuKu3SHz7M5FtxmTgmohcqmokqou78h32FiNmF");
+declare_id!("5ctGtA9pJWX5zqHhFCkaba8u7pcAp17GTeE28KUUJKHj");
 
 #[program]
 pub mod auction2 {
@@ -23,6 +23,7 @@ pub mod auction2 {
     _auction_meta_bump:u8, _base_bid_bump:u8, escrow_bump:u8, auction_valid_till:i64, requestprice:u64) -> ProgramResult {
 
         let auction_meta = &mut ctx.accounts.auction_meta;
+        let bid_acc = &mut ctx.accounts.base_bid;
         
         if ctx.accounts.clock.unix_timestamp > auction_valid_till {
             return Err(ProgramError::Custom(0x1));
@@ -41,6 +42,15 @@ pub mod auction2 {
             1,
         )?;
        
+
+        bid_acc.auction = auction_meta.key();
+        bid_acc.nftowner = ctx.accounts.nft_owner.key();
+        bid_acc.nftmint = ctx.accounts.nft_mint.key();
+        bid_acc.auction_valid_till = auction_meta.auction_valid_till;
+        bid_acc.bid_no = 0;
+        bid_acc.bidder = ctx.accounts.nft_owner.to_account_info().key();
+        bid_acc.bid_price = 0;
+        bid_acc.bid_expired = true;
 
         auction_meta.nftowner = ctx.accounts.nft_owner.to_account_info().key();
         auction_meta.nftmint = ctx.accounts.nft_mint.to_account_info().key();
@@ -84,13 +94,29 @@ pub mod auction2 {
             **ctx.accounts.previous_bid.to_account_info().try_borrow_mut_lamports()? -= auction_meta.bid_price;
             **ctx.accounts.previous_bidder.to_account_info().try_borrow_mut_lamports()? += auction_meta.bid_price;
         }
+
+         //MARK THE PREVIOUS BID AS EXPIRED
+        let previous_bid = &mut ctx.accounts.previous_bid;
+       
+        previous_bid.bid_expired = true;
+
+        //CURRENT BID
+
+        bid_acc.auction = auction_meta.key();
+        bid_acc.nftowner = ctx.accounts.nft_owner.key();
+        bid_acc.nftmint = ctx.accounts.nft_mint.key();
+        bid_acc.auction_valid_till = auction_meta.auction_valid_till;
+        bid_acc.bid_no = auction_meta.bids_placed + 1;
+        bid_acc.bidder = ctx.accounts.bid_maker.to_account_info().key();
+        bid_acc.bid_price = bid_price;
+        bid_acc.bid_expired = false;
+
+        //GLOBAL AUCTION
         auction_meta.bid_price = bid_price;
         auction_meta.bids_placed = auction_meta.bids_placed + 1;
         auction_meta.activebid = bid_acc.key();
 
-        bid_acc.auction = auction_meta.key();
-        bid_acc.bidder = ctx.accounts.bid_maker.to_account_info().key();
-        bid_acc.bid_price = bid_price;
+
         msg!("BIDS PLACED");
         Ok(())
     }
@@ -103,7 +129,7 @@ pub mod auction2 {
             return Err(ProgramError::Custom(0x3));
         }
         //TRANSFER TO THE OWNER
-        if (auction_meta.bids_placed == 0) {
+        if auction_meta.bids_placed == 0 {
             anchor_spl::token::transfer(
                 CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
@@ -252,13 +278,39 @@ pub mod auction2 {
             }
     
         }
-    
 
-    
-            auction_meta.complete = true;
-            Ok(())
+        let previous_bid = &mut ctx.accounts.present_bid_acc;
+       
+        previous_bid.bid_expired = true;
+        auction_meta.complete = true;
+        Ok(())
     }
     
+    pub fn close_auction(ctx: Context<CloseAuction>) -> ProgramResult {
+
+        if !ctx.accounts.auction_meta.complete  {
+            return Err(ProgramError::Custom(0x13));
+        }
+
+        if ctx.accounts.pda_rent.to_account_info().key() != ctx.accounts.data_acc.pda_rent {
+            return Err(ProgramError::Custom(0x14));
+        }
+
+        Ok(())
+    }
+    
+    pub fn close_bid(ctx: Context<CloseBid>) -> ProgramResult {
+
+        if !ctx.accounts.bid.bid_expired  {
+            return Err(ProgramError::Custom(0x13));
+        }
+
+        if ctx.accounts.pda_rent.to_account_info().key() != ctx.accounts.data_acc.pda_rent {
+            return Err(ProgramError::Custom(0x14));
+        }
+
+        Ok(())
+    }
     
     
 
@@ -293,10 +345,14 @@ pub struct NFTAuction {
 
 #[account]
 pub struct Bids {
-
     pub auction: Pubkey,
+    pub nftowner: Pubkey,
+    pub nftmint: Pubkey,
     pub bidder: Pubkey,
+    pub auction_valid_till: i64,
+    pub bid_no: u64,
     pub bid_price: u64,
+    pub bid_expired: bool,
 }
 
 
@@ -336,7 +392,7 @@ pub struct StartAuction<'info> {
     seeds = [nft_owner.to_account_info().key.as_ref(),
     nft_mint.to_account_info().key.as_ref(), auction_valid_till.to_be_bytes().as_ref()],
     bump = auction_meta_bump,
-    space = 700)]
+    space = 400)]
     pub auction_meta: Box<Account<'info, NFTAuction>>,
     
     #[account(init,
@@ -505,3 +561,55 @@ pub struct Redeem<'info> {
     pub clock: Sysvar<'info, Clock>,
 
 } 
+
+#[derive(Accounts)]
+#[instruction()]
+pub struct CloseAuction<'info> {
+    #[account( seeds = [b"data".as_ref()], bump)]
+    pub data_acc: Box<Account<'info, Data>>,
+
+    #[account(mut,
+    seeds = [auction_meta.nftowner.as_ref(),
+    auction_meta.nftmint.as_ref(), auction_meta.auction_valid_till.to_be_bytes().as_ref()],
+    bump,
+    close = pda_rent,
+    )]
+    pub auction_meta: Box<Account<'info, NFTAuction>>,
+
+    #[account(mut)]
+    pub pda_rent: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub rent: Sysvar<'info, Rent>,
+    pub clock: Sysvar<'info, Clock>,
+
+}
+
+#[derive(Accounts)]
+#[instruction()]
+pub struct CloseBid<'info> {
+    #[account( seeds = [b"data".as_ref()], bump)]
+    pub data_acc: Box<Account<'info, Data>>,
+
+    #[account(
+        mut,
+        seeds = [bid.nftowner.as_ref(), bid.nftmint.as_ref(),
+        bid.bidder.as_ref(),
+        bid.auction_valid_till.to_be_bytes().as_ref(),
+        (bid.bid_no as u64).to_be_bytes().as_ref()], bump,
+        close = pda_rent,
+        )]
+    pub bid: Box<Account<'info, Bids>>,
+
+    #[account(mut)]
+    pub pda_rent: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub rent: Sysvar<'info, Rent>,
+    pub clock: Sysvar<'info, Clock>,
+
+}
