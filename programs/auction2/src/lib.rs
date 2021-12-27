@@ -5,18 +5,31 @@ use anchor_spl::{
 
 };
 
-declare_id!("5ctGtA9pJWX5zqHhFCkaba8u7pcAp17GTeE28KUUJKHj");
+declare_id!("5gDB2y3bUpFKqfon7Ek31ZyDmMHHd1XN7FFDTVBKWdwZ");
 
 #[program]
 pub mod auction2 {
     use super::*;
     pub fn new(ctx: Context<Initialize>, _data_bump:u8, mk_cut:u64) -> ProgramResult {
         let data_acc = &mut ctx.accounts.data_acc;
+       
+
         data_acc.market_place = ctx.accounts.beneficiary.key();
         data_acc.market_place_cut = mk_cut;
-        data_acc.pda_rent = ctx.accounts.pda_rent.key();
-        
+        data_acc.deployer = ctx.accounts.payer.key();
         Ok(())
+    }
+
+    pub fn change_market_cut(ctx: Context<ChangeCut>, _data_bump:u8,
+        updated_cut: u64) -> ProgramResult {
+            let data_acc = &mut ctx.accounts.data_acc;
+
+            if ctx.accounts.payer.key() != data_acc.deployer {
+                 return Err(ProgramError::Custom(0x1));
+            }
+            data_acc.market_place_cut = updated_cut;
+
+            Ok(())
     }
 
     pub fn start_auction(ctx: Context<StartAuction>, _data_bump:u8,
@@ -26,7 +39,7 @@ pub mod auction2 {
         let bid_acc = &mut ctx.accounts.base_bid;
         
         if ctx.accounts.clock.unix_timestamp > auction_valid_till {
-            return Err(ProgramError::Custom(0x1));
+            return Err(ProgramError::Custom(0x2));
         }
 
         anchor_spl::token::transfer(
@@ -46,7 +59,7 @@ pub mod auction2 {
         bid_acc.auction = auction_meta.key();
         bid_acc.nftowner = ctx.accounts.nft_owner.key();
         bid_acc.nftmint = ctx.accounts.nft_mint.key();
-        bid_acc.auction_valid_till = auction_meta.auction_valid_till;
+        bid_acc.auction_valid_till = auction_valid_till;
         bid_acc.bid_no = 0;
         bid_acc.bidder = ctx.accounts.nft_owner.to_account_info().key();
         bid_acc.bid_price = 0;
@@ -60,6 +73,8 @@ pub mod auction2 {
         auction_meta.requestprice = requestprice;
         auction_meta.complete = false;
         auction_meta.escrowed_nft_bump = escrow_bump;
+        auction_meta.activebid = ctx.accounts.base_bid.to_account_info().key();
+
         Ok(())
     }
 
@@ -72,7 +87,7 @@ pub mod auction2 {
         if bid_price < auction_meta.requestprice || bid_price < auction_meta.bid_price
         ||  ctx.accounts.clock.unix_timestamp > auction_meta.auction_valid_till || auction_meta.complete {
             
-            return Err(ProgramError::Custom(0x2));
+            return Err(ProgramError::Custom(0x3));
         }
 
         let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
@@ -95,12 +110,11 @@ pub mod auction2 {
             **ctx.accounts.previous_bidder.to_account_info().try_borrow_mut_lamports()? += auction_meta.bid_price;
         }
 
-         //MARK THE PREVIOUS BID AS EXPIRED
+        
         let previous_bid = &mut ctx.accounts.previous_bid;
        
         previous_bid.bid_expired = true;
 
-        //CURRENT BID
 
         bid_acc.auction = auction_meta.key();
         bid_acc.nftowner = ctx.accounts.nft_owner.key();
@@ -111,7 +125,7 @@ pub mod auction2 {
         bid_acc.bid_price = bid_price;
         bid_acc.bid_expired = false;
 
-        //GLOBAL AUCTION
+    
         auction_meta.bid_price = bid_price;
         auction_meta.bids_placed = auction_meta.bids_placed + 1;
         auction_meta.activebid = bid_acc.key();
@@ -126,7 +140,7 @@ pub mod auction2 {
         let auction_meta = &mut ctx.accounts.auction_meta;
     
         if ctx.accounts.clock.unix_timestamp < auction_meta.auction_valid_till || auction_meta.complete {
-            return Err(ProgramError::Custom(0x3));
+            return Err(ProgramError::Custom(0x4));
         }
         //TRANSFER TO THE OWNER
         if auction_meta.bids_placed == 0 {
@@ -179,12 +193,10 @@ pub mod auction2 {
                             &[auction_meta.escrowed_nft_bump],
                         ]],
                     ),
-                    // The amount here is just the entire balance of the escrow account.
+                  
                 1,
         )?;
 
-    //Finally, close the escrow account and refund the maker (they paid for
-    // its rent-exemption).
     anchor_spl::token::close_account(CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
                     anchor_spl::token::CloseAccount {
@@ -200,7 +212,31 @@ pub mod auction2 {
         let mut taker_amount = auction_meta.bid_price;
             // Multi by 10
         let market_cut = ctx.accounts.data_acc.market_place_cut * taker_amount / 1000;
-        let sfb = metaplex_token_metadata::state::Metadata::from_account_info(&ctx.accounts.token_metadata_account)?.data.seller_fee_basis_points;
+
+
+    
+        
+
+        let mut sfb:u16 = 0; 
+        //owned by system program
+        if ctx.accounts.token_metadata_account.owner == ctx.accounts.system_program.key && ctx.accounts.token_metadata_account.lamports() == 0 {
+             sfb = 0;
+        } else {
+             let result = metaplex_token_metadata::state::Metadata::from_account_info(&ctx.accounts.token_metadata_account);
+       
+            
+             match result {
+                 Ok(metadata) => {
+                     sfb = metadata.data.seller_fee_basis_points;
+                  
+                 }
+                  Err(e) => {
+                      sfb = 0;
+                  
+                 }
+             }
+         }
+        
         let sfb_cut = sfb as u64 * taker_amount / 10000;
         taker_amount = taker_amount - (market_cut + sfb_cut);
         //TRANSFER THE SOL AND THEN THE NFT
@@ -209,10 +245,10 @@ pub mod auction2 {
         **ctx.accounts.nft_owner.to_account_info().try_borrow_mut_lamports()? += taker_amount;
     
         if *ctx.accounts.market_maker.key != ctx.accounts.data_acc.market_place {
-            return Err(ProgramError::Custom(0x4));
+            return Err(ProgramError::Custom(0x5));
         }
         
-        //Transfer to Market Maker
+
         **ctx.accounts.present_bid_acc.to_account_info().try_borrow_mut_lamports()? -= market_cut;
         **ctx.accounts.market_maker.to_account_info().try_borrow_mut_lamports()? += market_cut;
     
@@ -224,7 +260,7 @@ pub mod auction2 {
             for i in x {
                     if y == 0 {
                         if i.address != *ctx.accounts.creator0.key {
-                            return Err(ProgramError::Custom(0x5));
+                            return Err(ProgramError::Custom(0x6));
                         }
     
                         let temp =  sfb_cut as u64 * i.share as u64 / 100;
@@ -233,7 +269,7 @@ pub mod auction2 {
                     }
                     else if y == 1 {
                         if i.address != *ctx.accounts.creator1.key {
-                            return Err(ProgramError::Custom(0x5));
+                            return Err(ProgramError::Custom(0x7));
                         }
                                       
                         let temp =  sfb_cut as u64 * i.share as u64 / 100;
@@ -242,7 +278,7 @@ pub mod auction2 {
                     }
                     else if y == 2 {
                         if i.address != *ctx.accounts.creator2.key {
-                            return Err(ProgramError::Custom(0x5));
+                            return Err(ProgramError::Custom(0x8));
                         }
        
                         let temp =  sfb_cut as u64 * i.share as u64 / 100;
@@ -252,7 +288,7 @@ pub mod auction2 {
                     }
                     else if y == 3 {
                         if i.address != *ctx.accounts.creator3.key {
-                            return Err(ProgramError::Custom(0x5));
+                            return Err(ProgramError::Custom(0x9));
                         }
     
                         let temp =  sfb_cut as u64 * i.share as u64 / 100;
@@ -261,8 +297,8 @@ pub mod auction2 {
                         **ctx.accounts.creator3.to_account_info().try_borrow_mut_lamports()? += temp;
                     }
                     else if y == 4 {
-                        if i.address != *ctx.accounts.creator1.key {
-                            return Err(ProgramError::Custom(0x5));
+                        if i.address != *ctx.accounts.creator4.key {
+                            return Err(ProgramError::Custom(0x10));
                         }
     
         
@@ -285,36 +321,6 @@ pub mod auction2 {
         auction_meta.complete = true;
         Ok(())
     }
-    
-    pub fn close_auction(ctx: Context<CloseAuction>) -> ProgramResult {
-
-        if !ctx.accounts.auction_meta.complete  {
-            return Err(ProgramError::Custom(0x13));
-        }
-
-        if ctx.accounts.pda_rent.to_account_info().key() != ctx.accounts.data_acc.pda_rent {
-            return Err(ProgramError::Custom(0x14));
-        }
-
-        Ok(())
-    }
-    
-    pub fn close_bid(ctx: Context<CloseBid>) -> ProgramResult {
-
-        if !ctx.accounts.bid.bid_expired  {
-            return Err(ProgramError::Custom(0x13));
-        }
-
-        if ctx.accounts.pda_rent.to_account_info().key() != ctx.accounts.data_acc.pda_rent {
-            return Err(ProgramError::Custom(0x14));
-        }
-
-        Ok(())
-    }
-    
-    
-
-
 }
 
 #[account]
@@ -324,12 +330,12 @@ pub struct Data {
     
     pub market_place_cut: u64,
 
-    pub pda_rent: Pubkey,
+    pub deployer: Pubkey,
 
 }
 
 #[account]
-pub struct NFTAuction {
+pub struct Auctiondata {
 
     pub nftowner: Pubkey,
     pub nftmint: Pubkey,
@@ -363,9 +369,7 @@ pub struct Initialize<'info> {
 
     #[account(init, payer=payer, seeds = [b"data".as_ref()], bump = data_bump, space = 8 + 32 + 8 + 32 + 64 + 8)]
     pub data_acc: Account<'info, Data>,
-
- 
-
+     
     #[account(mut)]
     pub payer: Signer<'info>,
 
@@ -377,6 +381,21 @@ pub struct Initialize<'info> {
     pub rent: Sysvar<'info, Rent>,
 
     pub pda_rent: AccountInfo<'info>,
+
+}
+
+#[derive(Accounts)]
+#[instruction(data_bump: u8)]
+pub struct ChangeCut<'info> {
+    #[account(mut, seeds = [b"data".as_ref()], bump = data_bump,)]
+    pub data_acc: Account<'info, Data>,
+
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 
 }
 
@@ -393,14 +412,14 @@ pub struct StartAuction<'info> {
     nft_mint.to_account_info().key.as_ref(), auction_valid_till.to_be_bytes().as_ref()],
     bump = auction_meta_bump,
     space = 400)]
-    pub auction_meta: Box<Account<'info, NFTAuction>>,
+    pub auction_meta: Box<Account<'info, Auctiondata>>,
     
     #[account(init,
         payer = nft_owner,
         seeds = [nft_owner.to_account_info().key.as_ref(), nft_mint.to_account_info().key.as_ref(), nft_owner.to_account_info().key.as_ref(),
         auction_valid_till.to_be_bytes().as_ref(), (0 as u64).to_be_bytes().as_ref()],
         bump = base_bid_bump,
-        space = 700)]
+        space = 400)]
     pub base_bid: Box<Account<'info, Bids>>,
 
 
@@ -438,22 +457,19 @@ pub struct MakeBid<'info> {
         seeds = [nft_owner.to_account_info().key.as_ref(), nft_mint.to_account_info().key.as_ref(), auction_meta.auction_valid_till.to_be_bytes().as_ref()],
         bump
     )]
-    pub auction_meta: Box<Account<'info, NFTAuction>>,
+    pub auction_meta: Box<Account<'info, Auctiondata>>,
 
     #[account(init,
         payer = bid_maker,
         seeds = [nft_owner.to_account_info().key.as_ref(), nft_mint.to_account_info().key.as_ref(), bid_maker.to_account_info().key.as_ref(),
         auction_meta.auction_valid_till.to_be_bytes().as_ref(), (auction_meta.bids_placed + 1 as u64).to_be_bytes().as_ref()],
         bump,
-        space = 700)]
+        space = 400)]
     pub bid: Box<Account<'info, Bids>>,
 
-    
-    // #[account(constraint = nft_owner.key() == auction_meta.nft_owner)]
     #[account(mut)]
     pub nft_owner: AccountInfo<'info>,
     
-    // #[account(constraint = nft_mint.key() == auction_meta.nft_mint)]
     #[account()]
     pub nft_mint: Account<'info, Mint>,
     
@@ -470,6 +486,7 @@ pub struct MakeBid<'info> {
         auction_meta.auction_valid_till.to_be_bytes().as_ref(),
         (auction_meta.bids_placed as u64).to_be_bytes().as_ref()],
         bump,
+        close = previous_bidder
         )]
     pub previous_bid: Box<Account<'info, Bids>>,
 
@@ -491,9 +508,10 @@ pub struct Redeem<'info> {
 
     #[account(mut,
         seeds = [nft_owner.to_account_info().key.as_ref(), nft_mint.to_account_info().key.as_ref(), auction_meta.auction_valid_till.to_be_bytes().as_ref()],
-        bump
+        bump,
+        close = nft_owner
     )]
-    pub auction_meta: Box<Account<'info, NFTAuction>>,
+    pub auction_meta: Box<Account<'info, Auctiondata>>,
 
     #[account(mut ,constraint = nft_owner.key() == auction_meta.nftowner)]
     pub nft_owner: AccountInfo<'info>,
@@ -524,6 +542,7 @@ pub struct Redeem<'info> {
         auction_meta.auction_valid_till.to_be_bytes().as_ref(),
         (auction_meta.bids_placed as u64).to_be_bytes().as_ref()],
         bump,
+        close = latest_bidder
         )]
     pub present_bid_acc: Box<Account<'info, Bids>>,
 
@@ -562,54 +581,3 @@ pub struct Redeem<'info> {
 
 } 
 
-#[derive(Accounts)]
-#[instruction()]
-pub struct CloseAuction<'info> {
-    #[account( seeds = [b"data".as_ref()], bump)]
-    pub data_acc: Box<Account<'info, Data>>,
-
-    #[account(mut,
-    seeds = [auction_meta.nftowner.as_ref(),
-    auction_meta.nftmint.as_ref(), auction_meta.auction_valid_till.to_be_bytes().as_ref()],
-    bump,
-    close = pda_rent,
-    )]
-    pub auction_meta: Box<Account<'info, NFTAuction>>,
-
-    #[account(mut)]
-    pub pda_rent: AccountInfo<'info>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub rent: Sysvar<'info, Rent>,
-    pub clock: Sysvar<'info, Clock>,
-
-}
-
-#[derive(Accounts)]
-#[instruction()]
-pub struct CloseBid<'info> {
-    #[account( seeds = [b"data".as_ref()], bump)]
-    pub data_acc: Box<Account<'info, Data>>,
-
-    #[account(
-        mut,
-        seeds = [bid.nftowner.as_ref(), bid.nftmint.as_ref(),
-        bid.bidder.as_ref(),
-        bid.auction_valid_till.to_be_bytes().as_ref(),
-        (bid.bid_no as u64).to_be_bytes().as_ref()], bump,
-        close = pda_rent,
-        )]
-    pub bid: Box<Account<'info, Bids>>,
-
-    #[account(mut)]
-    pub pda_rent: AccountInfo<'info>,
-
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
-    pub associated_token_program: Program<'info, AssociatedToken>,
-    pub rent: Sysvar<'info, Rent>,
-    pub clock: Sysvar<'info, Clock>,
-
-}
